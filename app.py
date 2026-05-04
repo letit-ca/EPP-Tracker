@@ -98,8 +98,13 @@ with st.sidebar:
     st.divider()
     admin_key = st.text_input("Admin Access", type="password", help="Enter key to upload bills or clear data")
     
-    # Check against Streamlit secrets (for cloud) or default to 'admin' (for local)
-    if admin_key == st.secrets.get("ADMIN_PASSWORD", "admin"):
+    # Safely handle missing secrets file on local host
+    try:
+        correct_password = st.secrets.get("ADMIN_PASSWORD", "admin")
+    except Exception:
+        correct_password = "admin"
+
+    if admin_key == correct_password:
         st.subheader("Admin Tools")
         
         # Moved Upload to Sidebar
@@ -200,8 +205,9 @@ if not db_df.empty:
 
     with m4:
         st.markdown("**All-Time Stats**")
+        start_date = df['Date'].min().strftime('%b %Y')
         st.metric(label="Total Spend", value=f"${df['Actual Usage ($)'].sum():,.2f}")
-        st.caption(f"Avg: ${df['Actual Usage ($)'].mean():,.2f}/mo")
+        st.caption(f"From: {start_date} | Avg: ${df['Actual Usage ($)'].mean():,.2f}/mo")
 
     st.divider()
 
