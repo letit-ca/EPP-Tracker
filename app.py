@@ -94,21 +94,32 @@ with st.sidebar:
     - **Negative Balance (CREDIT):** You have paid more than you've used.
     """)
     
+    # --- ADMIN CONTROLS ---
     st.divider()
-    if st.button("🗑️ Clear All Data", help="Permanently delete all stored bill data"):
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("DROP TABLE IF EXISTS bills")
-        conn.close()
-        init_db()
-        st.rerun()
+    admin_key = st.text_input("Admin Access", type="password", help="Enter key to upload bills or clear data")
+    
+    # Check against Streamlit secrets (for cloud) or default to 'admin' (for local)
+    if admin_key == st.secrets.get("ADMIN_PASSWORD", "admin"):
+        st.subheader("Admin Tools")
+        
+        # Moved Upload to Sidebar
+        files = st.file_uploader("Upload Alectra PDF Bills", type="pdf", accept_multiple_files=True)
 
-files = st.file_uploader("Upload Alectra PDF Bills", type="pdf", accept_multiple_files=True)
+        if files:
+            for f in files:
+                data = parse_bill(f)
+                if data: 
+                    save_to_db(data)
+            st.success(f"Processed {len(files)} file(s).")
+            st.rerun()
 
-if files:
-    for f in files:
-        data = parse_bill(f)
-        if data: save_to_db(data)
-    st.success(f"Processed {len(files)} file(s).")
+        # Moved Clear Data to Sidebar inside Admin block
+        if st.button("🗑️ Clear All Data", help="Permanently delete all stored bill data"):
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("DROP TABLE IF EXISTS bills")
+            conn.close()
+            init_db()
+            st.rerun()
 
 db_df = load_from_db()
 
