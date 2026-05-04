@@ -15,24 +15,21 @@ DB_PATH = "bills_data.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS bills
-                 (bill_date TEXT, usage_val REAL, paid_val REAL, balance_val REAL, 
-                  month_str TEXT, filename TEXT, 
-                  UNIQUE(bill_date, filename))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS bills (bill_date TEXT PRIMARY KEY, usage_val REAL, paid_val REAL, balance_val REAL)''')
     conn.commit()
     conn.close()
 
 def save_to_db(data):
+    if data['Date'] == "Unknown":
+        return
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO bills VALUES (?, ?, ?, ?, ?, ?)", 
-                  (data['Date'].strftime('%Y-%m-%d') if isinstance(data['Date'], datetime) else "Unknown", 
+        c.execute("INSERT INTO bills (bill_date, usage_val, paid_val, balance_val) VALUES (?, ?, ?, ?)", 
+                  (data['Date'].strftime('%Y-%m-%d'), 
                    data['Actual Usage ($)'], 
                    data['Budget Paid ($)'], 
-                   data['EPP Balance ($)'], 
-                   data['Month'], 
-                   data['FileName']))
+                   data['EPP Balance ($)']))
         conn.commit()
     except sqlite3.IntegrityError:
         pass
@@ -41,6 +38,7 @@ def save_to_db(data):
 def load_from_db():
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM bills", conn)
+    df = pd.read_sql_query("SELECT bill_date, usage_val, paid_val, balance_val FROM bills", conn)
     conn.close()
     return df
 
@@ -110,9 +108,10 @@ db_df = load_from_db()
 
 if not db_df.empty:
     df = db_df.copy()
-    df.columns = ["Date", "Actual Usage ($)", "Budget Paid ($)", "EPP Balance ($)", "Month", "FileName"]
+    df.columns = ["Date", "Actual Usage ($)", "Budget Paid ($)", "EPP Balance ($)"]
     df['Date'] = pd.to_datetime(df['Date'])
-    df = df[df['Date'] != "Unknown"].sort_values("Date")
+    df['Month'] = df['Date'].dt.strftime("%b %Y")
+    df = df.sort_values("Date")
     
     # --- 0. STATUS BANNER ---
     latest = df.iloc[-1]
@@ -261,7 +260,8 @@ if not db_df.empty:
     # --- 5. RAW DATA ---
     with st.expander("View Full Reconciliation Table"):
         st.dataframe(
-            df.drop(columns=["
+            df.drop(columns=["Month"]),
+            column_config={
                 "Date": st.column_config.DateColumn(label="Invoice Date", format="MMMM DD, YYYY"),
                 "Actual Usage ($)": st.column_config.NumberColumn(format="$%.2f"),
                 "Budget Paid ($)": st.column_config.NumberColumn(format="$%.2f"),
