@@ -24,21 +24,19 @@ def save_to_db(data):
         return
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    try:
-        c.execute("INSERT INTO bills (bill_date, usage_val, paid_val, balance_val) VALUES (?, ?, ?, ?)", 
-                  (data['Date'].strftime('%Y-%m-%d'), 
-                   data['Actual Usage ($)'], 
-                   data['Budget Paid ($)'], 
-                   data['EPP Balance ($)']))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    # Use REPLACE to overwrite existing data for the same date, preventing duplicates
+    c.execute("INSERT OR REPLACE INTO bills (bill_date, usage_val, paid_val, balance_val) VALUES (?, ?, ?, ?)", 
+              (data['Date'].strftime('%Y-%m-%d'), 
+               data['Actual Usage ($)'], 
+               data['Budget Paid ($)'], 
+               data['EPP Balance ($)']))
+    conn.commit()
     conn.close()
 
 def load_from_db():
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM bills", conn)
-    df = pd.read_sql_query("SELECT bill_date, usage_val, paid_val, balance_val FROM bills", conn)
+    # Group by bill_date to ensure we only get one record per date even if the underlying schema allowed duplicates
+    df = pd.read_sql_query("SELECT bill_date, usage_val, paid_val, balance_val FROM bills GROUP BY bill_date", conn)
     conn.close()
     return df
 
@@ -95,6 +93,14 @@ with st.sidebar:
     - **Positive Balance (DEBT):** You have used more electricity than you've paid for.
     - **Negative Balance (CREDIT):** You have paid more than you've used.
     """)
+    
+    st.divider()
+    if st.button("🗑️ Clear All Data", help="Permanently delete all stored bill data"):
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DROP TABLE IF EXISTS bills")
+        conn.close()
+        init_db()
+        st.rerun()
 
 files = st.file_uploader("Upload Alectra PDF Bills", type="pdf", accept_multiple_files=True)
 
@@ -111,10 +117,16 @@ if not db_df.empty:
     df.columns = ["Date", "Actual Usage ($)", "Budget Paid ($)", "EPP Balance ($)"]
     df['Date'] = pd.to_datetime(df['Date'])
     df['Month'] = df['Date'].dt.strftime("%b %Y")
-    df = df.sort_values("Date")
+    df = df.sort_values("Date", ascending=False)
+    
+    # Calculate additional metrics
+    df['Usage vs Budget'] = df['Actual Usage ($)'] - df['Budget Paid ($)']
+    df['Variance %'] = (df['Usage vs Budget'] / df['Budget Paid ($)'] * 100).round(1)
+    df['MoM Change $'] = df['Actual Usage ($)'].diff(-1).round(2)
+    df['MoM Change %'] = (df['Actual Usage ($)'].pct_change(-1) * 100).round(1)
     
     # --- 0. STATUS BANNER ---
-    latest = df.iloc[-1]
+    latest = df.iloc[0]  # First row is newest (descending sort)
     latest_date_str = latest['Date'].strftime('%B %d, %Y')
     bal = latest['EPP Balance ($)']
 
@@ -130,8 +142,8 @@ if not db_df.empty:
     # --- 1. PERIOD COMPARISONS ---
     st.subheader("📊 Comparison & Historical Benchmarks")
     
-    # Logic for periods
-    previous = df.iloc[-2] if len(df) > 1 else None
+    # Logic for periods (df is now descending)
+    previous = df.iloc[1] if len(df) > 1 else None
     
     # Calendar YTD (Current Year)
     current_year = latest['Date'].year
@@ -141,31 +153,39 @@ if not db_df.empty:
     yoy_target_date = latest['Date'] - pd.DateOffset(years=1)
     yoy_match = df[df['Date'].dt.to_period('M') == yoy_target_date.to_period('M')]
     yoy_record = yoy_match.iloc[0] if not yoy_match.empty else None
+    
+    # 3-month trend
+    recent_3m = df.head(3)['Actual Usage ($)'].mean() if len(df) >= 3 else df.iloc[0]['Actual Usage ($)']
+    prior_3m = df.iloc[3:6]['Actual Usage ($)'].mean() if len(df) >= 6 else (df.iloc[1]['Actual Usage ($)'] if len(df) > 1 else recent_3m)
+    trend_direction = "📈" if recent_3m > prior_3m else "📉" if recent_3m < prior_3m else "➡️"
+    trend_pct = ((recent_3m - prior_3m) / prior_3m * 100) if prior_3m > 0 else 0
 
     m1, m2, m3, m4 = st.columns(4)
     
     with m1:
         st.markdown("**Previous Month**")
         if previous is not None:
+            prev_var = previous['Usage vs Budget']
+            var_color = "🔴" if prev_var > 0 else "🟢"
             st.metric(label=previous['Month'], value=f"${previous['Actual Usage ($)']:,.2f}")
-            st.caption(f"Budget: ${previous['Budget Paid ($)']:,.2f}")
+            st.caption(f"Budget: ${previous['Budget Paid ($)']:,.2f} | {var_color} ${prev_var:+,.2f}")
         else:
             st.write("N/A")
 
     with m2:
         st.markdown("**Current Month**")
+        curr_var = latest['Usage vs Budget']
+        var_color = "🔴" if curr_var > 0 else "🟢"
         st.metric(label=latest['Month'], value=f"${latest['Actual Usage ($)']:,.2f}")
-        st.caption(f"Budget: ${latest['Budget Paid ($)']:,.2f}")
+        st.caption(f"Budget: ${latest['Budget Paid ($)']:,.2f} | {var_color} ${curr_var:+,.2f}")
 
     with m3:
-        st.markdown("**Year-over-Year**")
-        if yoy_record is not None:
-            diff = latest['Actual Usage ($)'] - yoy_record['Actual Usage ($)']
-            pct = (diff / yoy_record['Actual Usage ($)']) * 100
-            st.metric(label=yoy_record['Month'], value=f"${yoy_record['Actual Usage ($)']:,.2f}", 
-                      delta=f"{pct:+.1f}% vs last year", delta_color="inverse")
+        st.markdown("**3-Month Trend**")
+        if prior_3m > 0:
+            st.metric(label="vs Prior Quarter", value=f"${recent_3m:,.2f}", 
+                      delta=f"{trend_pct:+.1f}% {trend_direction}", delta_color="inverse")
         else:
-            st.write("No data from 1 year ago")
+            st.write("Insufficient data")
 
     with m4:
         st.markdown("**All-Time Stats**")
@@ -177,20 +197,23 @@ if not db_df.empty:
     col1, col2 = st.columns([1, 1.2])
 
     # --- 2. ENBRIDGE-STYLE SUMMARY CARD ---
-    # This reflects the current EPP Cycle (last 12 months or total records if < 12)
-    ytd_df = df.tail(12)
+    # This reflects the current EPP Cycle (first 12 months for descending order)
+    ytd_df = df.head(12)
     ytd_actual_charges = ytd_df['Actual Usage ($)'].sum()
-    ytd_previous_installments = ytd_df['Budget Paid ($)'].iloc[:-1].sum() if len(ytd_df) > 1 else 0.0
+    ytd_budget_charges = ytd_df['Budget Paid ($)'].sum()
 
     with col1:
         st.subheader("📋 EPP Reconciliation Summary")
         with st.container(border=True):
-            st.markdown(f"**Cycle View:** {ytd_df.iloc[0]['Month']} to {latest['Month']}")
+            cycle_start = ytd_df.iloc[-1]['Month'] if len(ytd_df) > 1 else latest['Month']
+            cycle_end = latest['Month']
+            st.markdown(f"**Cycle View:** {cycle_start} to {cycle_end} (most recent)")
             st.write("")
             
             # Calendar YTD Info
             ytd_usage = ytd_cal_df['Actual Usage ($)'].sum()
-            st.markdown(f"**{current_year} Calendar YTD Spend:** `${ytd_usage:,.2f}`")
+            ytd_start_date = "Jan 1" if len(ytd_cal_df) > 0 else "N/A"
+            st.markdown(f"**{current_year} Calendar YTD Spend:** `${ytd_usage:,.2f}` ({ytd_start_date} - {latest_date_str.split(',')[0]})")
             st.markdown("---")
             
             # Row 1
@@ -198,51 +221,64 @@ if not db_df.empty:
             r1c1.write("Total Actual Charges (Current Cycle)")
             r1c2.write(f"**${ytd_actual_charges:,.2f}**")
             
+            # Row 1b - Cycle Variance
+            r1bc1, r1bc2 = st.columns([3, 1])
+            cycle_var = ytd_actual_charges - ytd_budget_charges
+            var_indicator = "🔴 Over" if cycle_var > 0 else "🟢 Under"
+            r1bc1.write(f"├─ Variance vs Budget")
+            r1bc2.write(f"{var_indicator}: ${abs(cycle_var):,.2f}")
+            
             # Row 2
             r2c1, r2c2 = st.columns([3, 1])
-            r2c1.write("EPP Previous Installments")
-            r2c2.write(f"**${ytd_previous_installments:,.2f}**")
+            r2c1.write("Total EPP Installments Paid")
+            r2c2.write(f"**${ytd_budget_charges:,.2f}**")
             
             # Row 3
             r3c1, r3c2 = st.columns([3, 1])
-            r3c1.write("This Month's Installment")
+            r3c1.write("Current Month's Installment")
             r3c2.write(f"**${latest['Budget Paid ($)']:,.2f}**")
             
             st.markdown("---")
             
             # Row 4 (Balance)
             r4c1, r4c2 = st.columns([3, 1])
-            r4c1.write("### EPP Balance")
-            r4c2.write(f"### ${bal:,.2f}")
+            r4c1.write("### Running Account Balance")
+            balance_indicator = "🔴" if bal > 0 else "🟢" if bal < 0 else "⚖️"
+            r4c2.write(f"### {balance_indicator} ${bal:,.2f}")
 
     # --- 3. VOLT'S ADVANCED INSIGHTS ---
     with col2:
         st.subheader("🧠 Intelligence & Forecasting")
         with st.container(border=True):
             avg_usage = ytd_df['Actual Usage ($)'].mean()
+            avg_budget = ytd_df['Budget Paid ($)'].mean()
             highest_month = ytd_df.loc[ytd_df['Actual Usage ($)'].idxmax()]
+            lowest_month = ytd_df.loc[ytd_df['Actual Usage ($)'].idxmin()]
             
             # Forecasting Logic
             months_tracked = len(ytd_df)
             current_diff = latest['EPP Balance ($)']
             monthly_drift = current_diff / months_tracked if months_tracked > 0 else 0
             projected_true_up = current_diff + (monthly_drift * (12 - months_tracked)) if months_tracked < 12 else current_diff
+            budget_efficiency = (avg_budget / avg_usage * 100) if avg_usage > 0 else 100
 
-            st.markdown(f"- **True Cost:** Your actual electricity usage averages **${avg_usage:,.2f}/month**.")
+            st.markdown(f"- **True Cost:** Your actual electricity usage averages **${avg_usage:,.2f}/month** (Budgeted: **${avg_budget:,.2f}/month**).")
+            st.markdown(f"- **Budget Efficiency:** Your EPP covers **{budget_efficiency:.1f}%** of average actual usage.")
             
             # Budget Check
-            if avg_usage > latest['Budget Paid ($)']:
-                st.warning(f"- **Budget Deficit:** You are underpaying by roughly **${(avg_usage - latest['Budget Paid ($)']):,.2f}** every month. Alectra may raise your installment soon.")
+            monthly_gap = avg_usage - avg_budget
+            if monthly_gap > 0:
+                st.warning(f"⚠️ **Monthly Deficit:** Underpaying by **${monthly_gap:,.2f}** per month on average. Alectra may adjust installment.")
             else:
-                st.success(f"- **Budget Surplus:** Your monthly payment is safely covering your average usage.")
+                st.success(f"✓ **Budget Status:** Monthly payment covers usage with **${abs(monthly_gap):,.2f}** cushion.")
                 
-            st.markdown(f"- **Peak Consumption:** Your most expensive month was **{highest_month['Month']}** at **${highest_month['Actual Usage ($)']:,.2f}**.")
+            st.markdown(f"- **Consumption Range:** Peak **{highest_month['Month']}** (${highest_month['Actual Usage ($)']:,.2f}) | Low **{lowest_month['Month']}** (${lowest_month['Actual Usage ($)']:,.2f})")
             
             # Forecast
             if months_tracked < 12:
-                st.info(f"- **True-Up Forecast:** Based on your current trajectory, if Alectra settles your account at month 12, your True-up balance will be approximately **${projected_true_up:,.2f}**.")
+                st.info(f"📊 **True-Up Forecast (Month {months_tracked}/12):** Projected balance at cycle end: **${projected_true_up:,.2f}**")
             else:
-                st.info(f"- **True-Up Status:** You have a full 12 months of data. Your current balance of **${latest['EPP Balance ($)']:,.2f}** is your final true-up amount for this cycle.")
+                st.info(f"✅ **True-Up Status:** Full 12-month cycle. Balance of **${latest['EPP Balance ($)']:,.2f}** is final for true-up.")
 
     # --- 4. CHARTS ---
     st.divider()
@@ -258,17 +294,26 @@ if not db_df.empty:
     st.plotly_chart(fig_area, use_container_width=True)
 
     # --- 5. RAW DATA ---
-    with st.expander("View Full Reconciliation Table"):
+    with st.expander("📊 View Full Reconciliation Table", expanded=True):
+        display_df = df[['Date', 'Month', 'Actual Usage ($)', 'Budget Paid ($)', 'Usage vs Budget', 'Variance %', 'EPP Balance ($)', 'MoM Change $', 'MoM Change %']].copy()
+        display_df['Date'] = display_df['Date'].dt.strftime("%b %d, %Y")
+        
         st.dataframe(
-            df.drop(columns=["Month"]),
+            display_df,
             column_config={
-                "Date": st.column_config.DateColumn(label="Invoice Date", format="MMMM DD, YYYY"),
-                "Actual Usage ($)": st.column_config.NumberColumn(format="$%.2f"),
-                "Budget Paid ($)": st.column_config.NumberColumn(format="$%.2f"),
-                "EPP Balance ($)": st.column_config.NumberColumn(format="$%.2f"),
+                "Date": st.column_config.TextColumn(label="Invoice Date"),
+                "Month": st.column_config.TextColumn(label="Period"),
+                "Actual Usage ($)": st.column_config.NumberColumn(label="Actual Charge", format="$%.2f"),
+                "Budget Paid ($)": st.column_config.NumberColumn(label="EPP Payment", format="$%.2f"),
+                "Usage vs Budget": st.column_config.NumberColumn(label="Variance $", format="$%.2f"),
+                "Variance %": st.column_config.NumberColumn(label="Variance %", format="%.1f%%"),
+                "EPP Balance ($)": st.column_config.NumberColumn(label="Running Balance", format="$%.2f"),
+                "MoM Change $": st.column_config.NumberColumn(label="MoM $ Change", format="$%.2f"),
+                "MoM Change %": st.column_config.NumberColumn(label="MoM % Change", format="%.1f%%"),
             },
             use_container_width=True,
             hide_index=True
         )
+        st.caption("📌 Most recent invoices first. MoM = Month-over-Month change.")
 else:
     st.info("No data found. Please upload your Alectra PDF bills to begin tracking.")
